@@ -7,6 +7,7 @@ use crate::mutation::Mutant;
 
 pub mod assignment_mutator;
 pub mod binary_op_mutator;
+pub mod brutalizer_mutator;
 pub mod delete_expression_mutator;
 pub mod elim_delegate_mutator;
 pub mod mutator_registry;

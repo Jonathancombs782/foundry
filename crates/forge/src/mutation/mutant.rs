@@ -225,6 +225,15 @@ pub enum MutationType {
     /// replace x with all other operator in op
     /// Pre or post- are different UnOp
     UnaryOperator(UnaryOpMutated),
+
+    /// Brutalized function argument (inspired by Solady's Brutalizer.sol).
+    /// Dirties the upper/lower bits of arguments to test input validation.
+    Brutalized {
+        arg_index: usize,
+        original_arg: String,
+        brutalized_arg: String,
+        mutated_call: String,
+    },
 }
 
 impl Display for MutationType {
@@ -240,6 +249,8 @@ impl Display for MutationType {
             Self::ElimDelegate => write!(f, "call"),
             Self::UnaryOperator(mutated) => write!(f, "{mutated}"),
             Self::RequireCondition { mutated_call } => write!(f, "{mutated_call}"),
+
+            Self::Brutalized { mutated_call, .. } => write!(f, "{mutated_call}"),
 
             Self::FunctionCall
             | Self::Require

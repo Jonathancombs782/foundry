@@ -4,13 +4,14 @@ use super::{
 };
 use crate::executors::{Executor, RawCallResult};
 use alloy_dyn_abi::JsonAbiExt;
+use alloy_primitives::I256;
 use eyre::Result;
 use foundry_config::InvariantConfig;
 use foundry_evm_core::utils::StateChangeset;
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_fuzz::{
-    FuzzedCases,
-    invariant::{BasicTxDetails, FuzzRunIdentifiedContracts, InvariantContract},
+    BasicTxDetails, FuzzedCases,
+    invariant::{FuzzRunIdentifiedContracts, InvariantContract},
 };
 use revm_inspectors::tracing::CallTraceArena;
 use std::{borrow::Cow, collections::HashMap};
@@ -32,8 +33,13 @@ pub struct InvariantFuzzTestResult {
     pub line_coverage: Option<HitMaps>,
     /// Fuzzed selectors metrics collected during the invariant test runs.
     pub metrics: HashMap<String, InvariantMetrics>,
-    /// NUmber of failed replays from persisted corpus.
+    /// Number of failed replays from persisted corpus.
     pub failed_corpus_replays: usize,
+    /// For optimization mode (int256 return): the best (maximum) value achieved.
+    /// None means standard invariant check mode.
+    pub optimization_best_value: Option<I256>,
+    /// For optimization mode: the call sequence that produced the best value.
+    pub optimization_best_sequence: Vec<BasicTxDetails>,
 }
 
 /// Enriched results of an invariant run check.
@@ -45,7 +51,7 @@ pub(crate) struct RichInvariantResults {
 }
 
 impl RichInvariantResults {
-    fn new(can_continue: bool, call_result: Option<RawCallResult>) -> Self {
+    pub(crate) fn new(can_continue: bool, call_result: Option<RawCallResult>) -> Self {
         Self { can_continue, call_result }
     }
 }
@@ -95,15 +101,19 @@ pub(crate) fn assert_invariants(
 
 /// Returns if invariant test can continue and last successful call result of the invariant test
 /// function (if it can continue).
+///
+/// For optimization mode (int256 return), tracks the max value but never fails on invariant.
+/// For check mode, asserts the invariant and fails if broken.
 pub(crate) fn can_continue(
     invariant_contract: &InvariantContract<'_>,
-    invariant_test: &InvariantTest,
+    invariant_test: &mut InvariantTest,
     invariant_run: &mut InvariantTestRun,
     invariant_config: &InvariantConfig,
     call_result: RawCallResult,
     state_changeset: &StateChangeset,
 ) -> Result<RichInvariantResults> {
     let mut call_results = None;
+    let is_optimization = invariant_contract.is_optimization();
 
     let handlers_succeeded = || {
         invariant_test.targeted_contracts.targets.lock().keys().all(|address| {
@@ -116,26 +126,42 @@ pub(crate) fn can_continue(
         })
     };
 
-    // Assert invariants if the call did not revert and the handlers did not fail.
     if !call_result.reverted && handlers_succeeded() {
         if let Some(traces) = call_result.traces {
             invariant_run.run_traces.push(traces);
         }
 
-        call_results = assert_invariants(
-            invariant_contract,
-            invariant_config,
-            &invariant_test.targeted_contracts,
-            &invariant_run.executor,
-            &invariant_run.inputs,
-            &mut invariant_test.execution_data.borrow_mut().failures,
-        )?;
-        if call_results.is_none() {
-            return Ok(RichInvariantResults::new(false, None));
+        if is_optimization {
+            // Optimization mode: call invariant and track max value, never fail.
+            let (inv_result, success) = call_invariant_function(
+                &invariant_run.executor,
+                invariant_contract.address,
+                invariant_contract.invariant_function.abi_encode_input(&[])?.into(),
+            )?;
+            if success
+                && inv_result.result.len() >= 32
+                && let Some(value) = I256::try_from_be_slice(&inv_result.result[..32])
+            {
+                invariant_test.update_optimization_value(value, &invariant_run.inputs);
+            }
+            call_results = Some(inv_result);
+        } else {
+            // Check mode: assert invariants and fail if broken.
+            call_results = assert_invariants(
+                invariant_contract,
+                invariant_config,
+                &invariant_test.targeted_contracts,
+                &invariant_run.executor,
+                &invariant_run.inputs,
+                &mut invariant_test.test_data.failures,
+            )?;
+            if call_results.is_none() {
+                return Ok(RichInvariantResults::new(false, None));
+            }
         }
     } else {
         // Increase the amount of reverts.
-        let mut invariant_data = invariant_test.execution_data.borrow_mut();
+        let invariant_data = &mut invariant_test.test_data;
         invariant_data.failures.reverts += 1;
         // If fail on revert is set, we must return immediately.
         if invariant_config.fail_on_revert {
@@ -151,9 +177,10 @@ pub(crate) fn can_continue(
             invariant_data.failures.error = Some(InvariantFuzzError::Revert(case_data));
 
             return Ok(RichInvariantResults::new(false, None));
-        } else if call_result.reverted {
+        } else if call_result.reverted && !is_optimization {
             // If we don't fail test on revert then remove last reverted call from inputs.
-            // This improves shrinking performance as irrelevant calls won't be checked again.
+            // In optimization mode, we keep reverted calls to preserve warp/roll values
+            // for correct replay during shrinking.
             invariant_run.inputs.pop();
         }
     }
@@ -164,7 +191,7 @@ pub(crate) fn can_continue(
 /// If call fails then the invariant test is considered failed.
 pub(crate) fn assert_after_invariant(
     invariant_contract: &InvariantContract<'_>,
-    invariant_test: &InvariantTest,
+    invariant_test: &mut InvariantTest,
     invariant_run: &InvariantTestRun,
     invariant_config: &InvariantConfig,
 ) -> Result<bool> {

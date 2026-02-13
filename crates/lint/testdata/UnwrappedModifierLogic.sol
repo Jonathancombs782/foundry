@@ -1,12 +1,14 @@
+//@compile-flags: --severity code-size
+
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.0;
+pragma solidity ^0.8.18;
 
 library Lib {
     function onlyOwner(address sender) internal {}
 }
 
 contract C {
-    function onlyOwner() public {}
+    function onlyOwner(address sender) public {}
 }
 
 /**
@@ -24,6 +26,28 @@ contract UnwrappedModifierLogicTest {
     event DidSomething(address who);
     mapping(address => bool) isOwner;
     mapping(address => mapping(bytes32 => bool)) hasRole;
+
+    /// -----------------------------------------------------------------------
+    /// Exceptions (assembly block)
+    /// -----------------------------------------------------------------------
+
+    modifier freeTempMemory() {
+        uint256 m;
+        assembly ("memory-safe") {
+            m := mload(0x40)
+        }
+        _;
+        assembly ("memory-safe") {
+            mstore(0x40, m)
+        }
+    }
+
+    modifier assemblyBlock(address sender) {
+        assembly {
+            let x := sender
+        }
+        _;
+    }
 
     /// -----------------------------------------------------------------------
     /// Good patterns (only 1 valid statement before or after placeholder)
@@ -64,7 +88,7 @@ contract UnwrappedModifierLogicTest {
     /// -----------------------------------------------------------------------
 
     // Bad because there are multiple valid function calls before the placeholder
-    modifier multipleBeforePlaceholder() { //~NOTE: wrap modifier logic to reduce code size  
+    modifier multipleBeforePlaceholder() { //~NOTE: wrap modifier logic to reduce code size
         checkPublic(msg.sender); // These should become _multipleBeforePlaceholder()
         checkPrivate(msg.sender);
         checkInternal(msg.sender);
@@ -124,14 +148,6 @@ contract UnwrappedModifierLogicTest {
     modifier assign(address sender) { //~NOTE: wrap modifier logic to reduce code size
         bool _isOwner = true;
         isOwner[sender] = _isOwner;
-        _;
-    }
-
-    // Only call expressions are allowed (public/private/internal functions).
-    modifier assemblyBlock(address sender) { //~NOTE: wrap modifier logic to reduce code size
-        assembly {
-            let x := sender
-        }
         _;
     }
 

@@ -2,7 +2,6 @@ use crate::opts::ChainValueParser;
 use alloy_chains::ChainKind;
 use clap::Parser;
 use eyre::Result;
-use foundry_block_explorers::EtherscanApiVersion;
 use foundry_config::{
     Chain, Config, FigmentProviders,
     figment::{
@@ -18,6 +17,7 @@ use std::borrow::Cow;
 const FLASHBOTS_URL: &str = "https://rpc.flashbots.net/fast";
 
 #[derive(Clone, Debug, Default, Parser)]
+#[command(next_help_heading = "Rpc options")]
 pub struct RpcOpts {
     /// The RPC endpoint, default value is http://localhost:8545.
     #[arg(short = 'r', long = "rpc-url", env = "ETH_RPC_URL")]
@@ -29,6 +29,14 @@ pub struct RpcOpts {
     /// client to accept invalid certificates.
     #[arg(short = 'k', long = "insecure", default_value = "false")]
     pub accept_invalid_certs: bool,
+
+    /// Disable automatic proxy detection.
+    ///
+    /// Use this in sandboxed environments (e.g., Cursor IDE sandbox, macOS App Sandbox) where
+    /// system proxy detection causes crashes. When enabled, HTTP_PROXY/HTTPS_PROXY environment
+    /// variables and system proxy settings will be ignored.
+    #[arg(long = "no-proxy", alias = "disable-proxy", default_value = "false")]
+    pub no_proxy: bool,
 
     /// Use the Flashbots RPC URL with fast mode (<https://rpc.flashbots.net/fast>).
     ///
@@ -61,6 +69,10 @@ pub struct RpcOpts {
     /// Specify custom headers for RPC requests.
     #[arg(long, alias = "headers", env = "ETH_RPC_HEADERS", value_delimiter(','))]
     pub rpc_headers: Option<Vec<String>>,
+
+    /// Print the equivalent curl command instead of making the RPC request.
+    #[arg(long)]
+    pub curl: bool,
 }
 
 impl_figment_convert_cast!(RpcOpts);
@@ -114,6 +126,9 @@ impl RpcOpts {
         if self.accept_invalid_certs {
             dict.insert("eth_rpc_accept_invalid_certs".into(), true.into());
         }
+        if self.no_proxy {
+            dict.insert("eth_rpc_no_proxy".into(), true.into());
+        }
         dict
     }
 
@@ -131,16 +146,6 @@ pub struct EtherscanOpts {
     #[arg(short = 'e', long = "etherscan-api-key", alias = "api-key", env = "ETHERSCAN_API_KEY")]
     #[serde(rename = "etherscan_api_key", skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-
-    /// The Etherscan API version.
-    #[arg(
-        short,
-        long = "etherscan-api-version",
-        alias = "api-version",
-        env = "ETHERSCAN_API_VERSION"
-    )]
-    #[serde(rename = "etherscan_api_version", skip_serializing_if = "Option::is_none")]
-    pub api_version: Option<EtherscanApiVersion>,
 
     /// The chain name or EIP-155 chain ID.
     #[arg(
@@ -181,10 +186,6 @@ impl EtherscanOpts {
         let mut dict = Dict::new();
         if let Some(key) = self.key() {
             dict.insert("etherscan_api_key".into(), key.into());
-        }
-
-        if let Some(api_version) = &self.api_version {
-            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
         }
 
         if let Some(chain) = self.chain {

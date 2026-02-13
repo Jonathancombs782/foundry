@@ -1,21 +1,18 @@
-use super::{
-    call_after_invariant_function, call_invariant_function, error::FailedInvariantCaseData,
-    shrink_sequence,
+use super::{call_after_invariant_function, call_invariant_function, execute_tx};
+use crate::executors::{
+    EarlyExit, Executor,
+    invariant::shrink::{shrink_sequence, shrink_sequence_value},
 };
-use crate::executors::Executor;
 use alloy_dyn_abi::JsonAbiExt;
-use alloy_primitives::{Log, U256, map::HashMap};
+use alloy_primitives::{I256, Log, map::HashMap};
 use eyre::Result;
 use foundry_common::{ContractsByAddress, ContractsByArtifact};
+use foundry_config::InvariantConfig;
 use foundry_evm_coverage::HitMaps;
-use foundry_evm_fuzz::{
-    BaseCounterExample,
-    invariant::{BasicTxDetails, InvariantContract},
-};
+use foundry_evm_fuzz::{BaseCounterExample, BasicTxDetails, invariant::InvariantContract};
 use foundry_evm_traces::{TraceKind, TraceMode, Traces, load_contracts};
 use indicatif::ProgressBar;
 use parking_lot::RwLock;
-use proptest::test_runner::TestError;
 use std::sync::Arc;
 
 /// Replays a call sequence for collecting logs and traces.
@@ -42,16 +39,13 @@ pub fn replay_run(
 
     // Replay each call from the sequence, collect logs, traces and coverage.
     for tx in inputs {
-        let call_result = executor.transact_raw(
-            tx.sender,
-            tx.call_details.target,
-            tx.call_details.calldata.clone(),
-            U256::ZERO,
-        )?;
-
-        logs.extend(call_result.logs);
+        let mut call_result = execute_tx(&mut executor, tx)?;
+        logs.extend(call_result.logs.clone());
         traces.push((TraceKind::Execution, call_result.traces.clone().unwrap()));
-        HitMaps::merge_opt(line_coverage, call_result.line_coverage);
+        HitMaps::merge_opt(line_coverage, call_result.line_coverage.clone());
+
+        // Commit state changes to persist across calls in the sequence.
+        executor.commit(&mut call_result);
 
         // Identify newly generated contracts, if they exist.
         ided_contracts
@@ -59,9 +53,7 @@ pub fn replay_run(
 
         // Create counter example to be used in failed case.
         counterexample_sequence.push(BaseCounterExample::from_invariant_call(
-            tx.sender,
-            tx.call_details.target,
-            &tx.call_details.calldata,
+            tx,
             &ided_contracts,
             call_result.traces,
             show_solidity,
@@ -98,12 +90,18 @@ pub fn replay_run(
     Ok(counterexample_sequence)
 }
 
-/// Replays the error case, shrinks the failing sequence and collects all necessary traces.
+/// Replays and shrinks a call sequence, collecting logs and traces.
+///
+/// For check mode (target_value=None): shrinks to find shortest failing sequence.
+/// For optimization mode (target_value=Some): shrinks to find shortest sequence producing target.
 #[expect(clippy::too_many_arguments)]
 pub fn replay_error(
-    failed_case: &FailedInvariantCaseData,
-    invariant_contract: &InvariantContract<'_>,
+    config: InvariantConfig,
     mut executor: Executor,
+    calls: &[BasicTxDetails],
+    inner_sequence: Option<Vec<Option<BasicTxDetails>>>,
+    target_value: Option<I256>,
+    invariant_contract: &InvariantContract<'_>,
     known_contracts: &ContractsByArtifact,
     ided_contracts: ContractsByAddress,
     logs: &mut Vec<Log>,
@@ -111,38 +109,38 @@ pub fn replay_error(
     line_coverage: &mut Option<HitMaps>,
     deprecated_cheatcodes: &mut HashMap<&'static str, Option<&'static str>>,
     progress: Option<&ProgressBar>,
-    show_solidity: bool,
+    early_exit: &EarlyExit,
 ) -> Result<Vec<BaseCounterExample>> {
-    match failed_case.test_error {
-        // Don't use at the moment.
-        TestError::Abort(_) => Ok(vec![]),
-        TestError::Fail(_, ref calls) => {
-            // Shrink sequence of failed calls.
-            let calls = shrink_sequence(
-                failed_case,
-                calls,
-                &executor,
-                invariant_contract.call_after_invariant,
-                progress,
-            )?;
+    let calls = if let Some(target) = target_value {
+        shrink_sequence_value(
+            &config,
+            invariant_contract,
+            calls,
+            &executor,
+            target,
+            progress,
+            early_exit,
+        )?
+    } else {
+        shrink_sequence(&config, invariant_contract, calls, &executor, progress, early_exit)?
+    };
 
-            set_up_inner_replay(&mut executor, &failed_case.inner_sequence);
-
-            // Replay calls to get the counterexample and to collect logs, traces and coverage.
-            replay_run(
-                invariant_contract,
-                executor,
-                known_contracts,
-                ided_contracts,
-                logs,
-                traces,
-                line_coverage,
-                deprecated_cheatcodes,
-                &calls,
-                show_solidity,
-            )
-        }
+    if let Some(sequence) = inner_sequence {
+        set_up_inner_replay(&mut executor, &sequence);
     }
+
+    replay_run(
+        invariant_contract,
+        executor,
+        known_contracts,
+        ided_contracts,
+        logs,
+        traces,
+        line_coverage,
+        deprecated_cheatcodes,
+        &calls,
+        config.show_solidity,
+    )
 }
 
 /// Sets up the calls generated by the internal fuzzer, if they exist.

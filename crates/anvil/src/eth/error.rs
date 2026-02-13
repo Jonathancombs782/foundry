@@ -1,6 +1,7 @@
 //! Aggregated error type for this module
 
 use crate::eth::pool::transactions::PoolTransaction;
+use alloy_consensus::crypto::RecoveryError;
 use alloy_evm::overrides::StateOverrideError;
 use alloy_primitives::{B256, Bytes, SignatureError};
 use alloy_rpc_types::BlockNumberOrTag;
@@ -42,10 +43,12 @@ pub enum BlockchainError {
     FailedToDecodeReceipt,
     #[error("Failed to decode state")]
     FailedToDecodeStateDump,
-    #[error("Prevrandao not in th EVM's environment after merge")]
+    #[error("Prevrandao not in the EVM's environment after merge")]
     PrevrandaoNotSet,
     #[error(transparent)]
     SignatureError(#[from] SignatureError),
+    #[error(transparent)]
+    RecoveryError(#[from] RecoveryError),
     #[error(transparent)]
     SignerError(#[from] SignerError),
     #[error("Rpc Endpoint not implemented")]
@@ -70,6 +73,9 @@ pub enum BlockchainError {
     BlockOutOfRange(u64, u64),
     #[error("Resource not found")]
     BlockNotFound,
+    /// Thrown when a requested transaction is not found
+    #[error("transaction not found")]
+    TransactionNotFound,
     #[error("Required data unavailable")]
     DataUnavailable,
     #[error("Trie error: {0}")]
@@ -102,7 +108,7 @@ pub enum BlockchainError {
         "op-stack deposit tx received but is not supported.\n\nYou can use it by running anvil with '--optimism'."
     )]
     DepositTransactionUnsupported,
-    #[error("UnknownTransactionType not supported ")]
+    #[error("Unknown transaction type not supported")]
     UnknownTransactionType,
     #[error("Excess blob gas not set.")]
     ExcessBlobGasNotSet,
@@ -115,8 +121,8 @@ pub enum BlockchainError {
         /// Duration that was waited before timing out
         duration: Duration,
     },
-    #[error("Failed to parse transaction request: missing required fields")]
-    MissingRequiredFields,
+    #[error("Invalid transaction request: {0}")]
+    InvalidTransactionRequest(String),
 }
 
 impl From<eyre::Report> for BlockchainError {
@@ -162,6 +168,7 @@ where
                 OpTransactionError::HaltedDepositPostRegolith => {
                     Self::DepositTransactionUnsupported
                 }
+                OpTransactionError::MissingEnvelopedTx => Self::InvalidTransaction(err.into()),
             },
             EVMError::Header(err) => match err {
                 InvalidHeader::ExcessBlobGasNotSet => Self::ExcessBlobGasNotSet,
@@ -175,21 +182,7 @@ where
 
 impl From<WalletError> for BlockchainError {
     fn from(value: WalletError) -> Self {
-        match value {
-            WalletError::ValueNotZero => Self::Message("tx value not zero".to_string()),
-            WalletError::FromSet => Self::Message("tx from field is set".to_string()),
-            WalletError::NonceSet => Self::Message("tx nonce is set".to_string()),
-            WalletError::InvalidAuthorization => {
-                Self::Message("invalid authorization address".to_string())
-            }
-            WalletError::IllegalDestination => Self::Message(
-                "the destination of the transaction is not a delegated account".to_string(),
-            ),
-            WalletError::InternalError => Self::Message("internal error".to_string()),
-            WalletError::InvalidTransactionRequest => {
-                Self::Message("invalid tx request".to_string())
-            }
-        }
+        Self::Message(value.to_string())
     }
 }
 
@@ -295,7 +288,7 @@ pub enum InvalidTransactionError {
     /// Thrown when the block's `blob_gas_price` is greater than tx-specified
     /// `max_fee_per_blob_gas` after Cancun.
     #[error("Block `blob_gas_price` is greater than tx-specified `max_fee_per_blob_gas`")]
-    BlobFeeCapTooLow,
+    BlobFeeCapTooLow(u128, u128),
     /// Thrown when we receive a tx with `blob_versioned_hashes` and we're not on the Cancun hard
     /// fork.
     #[error("Block `blob_versioned_hashes` is not supported before the Cancun hardfork")]
@@ -331,6 +324,9 @@ pub enum InvalidTransactionError {
     /// Deposit transaction error post regolith
     #[error("op-deposit failure post regolith")]
     DepositTxErrorPostRegolith,
+    /// Missing enveloped transaction
+    #[error("missing enveloped transaction")]
+    MissingEnvelopedTx,
 }
 
 impl From<InvalidTransaction> for InvalidTransactionError {
@@ -346,7 +342,7 @@ impl From<InvalidTransaction> for InvalidTransactionError {
                 Self::GasTooHigh(ErrDetail { detail: String::from("CallGasCostMoreThanGasLimit") })
             }
             InvalidTransaction::GasFloorMoreThanGasLimit { .. } => {
-                Self::GasTooHigh(ErrDetail { detail: String::from("CallGasCostMoreThanGasLimit") })
+                Self::GasTooHigh(ErrDetail { detail: String::from("GasFloorMoreThanGasLimit") })
             }
             InvalidTransaction::RejectCallerWithCode => Self::SenderNoEOA,
             InvalidTransaction::LackOfFundForMaxFee { .. } => Self::InsufficientFunds,
@@ -356,7 +352,10 @@ impl From<InvalidTransaction> for InvalidTransactionError {
             InvalidTransaction::NonceTooHigh { .. } => Self::NonceTooHigh,
             InvalidTransaction::NonceTooLow { .. } => Self::NonceTooLow,
             InvalidTransaction::AccessListNotSupported => Self::AccessListNotSupported,
-            InvalidTransaction::BlobGasPriceGreaterThanMax => Self::BlobFeeCapTooLow,
+            InvalidTransaction::BlobGasPriceGreaterThanMax {
+                block_blob_gas_price,
+                tx_max_fee_per_blob_gas,
+            } => Self::BlobFeeCapTooLow(block_blob_gas_price, tx_max_fee_per_blob_gas),
             InvalidTransaction::BlobVersionedHashesNotSupported => {
                 Self::BlobVersionedHashesNotSupported
             }
@@ -380,7 +379,8 @@ impl From<InvalidTransaction> for InvalidTransactionError {
             | InvalidTransaction::EmptyAuthorizationList
             | InvalidTransaction::Eip7873NotSupported
             | InvalidTransaction::Eip7873MissingTarget
-            | InvalidTransaction::MissingChainId => Self::Revm(err),
+            | InvalidTransaction::MissingChainId
+            | InvalidTransaction::Str(_) => Self::Revm(err),
         }
     }
 }
@@ -391,6 +391,7 @@ impl From<OpTransactionError> for InvalidTransactionError {
             OpTransactionError::Base(err) => err.into(),
             OpTransactionError::DepositSystemTxPostRegolith
             | OpTransactionError::HaltedDepositPostRegolith => Self::DepositTxErrorPostRegolith,
+            OpTransactionError::MissingEnvelopedTx => Self::MissingEnvelopedTx,
         }
     }
 }
@@ -527,6 +528,11 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
                     message: err.to_string().into(),
                     data: None,
                 },
+                err @ BlockchainError::TransactionNotFound => RpcError {
+                    code: ErrorCode::ServerError(-32001),
+                    message: err.to_string().into(),
+                    data: None,
+                },
                 err @ BlockchainError::DataUnavailable => {
                     RpcError::internal_error_with(err.to_string())
                 }
@@ -565,7 +571,10 @@ impl<T: Serialize> ToRpcResponseResult for Result<T> {
                 err @ BlockchainError::UnknownTransactionType => {
                     RpcError::invalid_params(err.to_string())
                 }
-                err @ BlockchainError::MissingRequiredFields => {
+                err @ BlockchainError::InvalidTransactionRequest(_) => {
+                    RpcError::invalid_params(err.to_string())
+                }
+                err @ BlockchainError::RecoveryError(_) => {
                     RpcError::invalid_params(err.to_string())
                 }
             }

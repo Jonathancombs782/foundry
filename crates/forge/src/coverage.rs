@@ -1,9 +1,11 @@
 //! Coverage reports.
 
 use alloy_primitives::map::{HashMap, HashSet};
-use comfy_table::{Attribute, Cell, Color, Row, Table, modifiers::UTF8_ROUND_CORNERS};
+use comfy_table::{
+    Attribute, Cell, Color, Row, Table, modifiers::UTF8_ROUND_CORNERS, presets::ASCII_MARKDOWN,
+};
 use evm_disassembler::disassemble_bytes;
-use foundry_common::fs;
+use foundry_common::{fs, shell};
 use semver::Version;
 use std::{
     collections::hash_map,
@@ -38,7 +40,11 @@ pub struct CoverageSummaryReporter {
 impl Default for CoverageSummaryReporter {
     fn default() -> Self {
         let mut table = Table::new();
-        table.apply_modifier(UTF8_ROUND_CORNERS);
+        if shell::is_markdown() {
+            table.load_preset(ASCII_MARKDOWN);
+        } else {
+            table.apply_modifier(UTF8_ROUND_CORNERS);
+        }
 
         table.set_header(vec![
             Cell::new("File"),
@@ -129,6 +135,19 @@ impl CoverageReporter for LcovReporter {
             writeln!(out, "TN:")?;
             writeln!(out, "SF:{}", path.display())?;
 
+            // First pass: collect line hits for DA records.
+            // Track both which lines have been recorded and the max hits per line.
+            let mut line_hits: HashMap<u32, u32> = HashMap::default();
+            for item in &items {
+                if matches!(item.kind, CoverageItemKind::Line | CoverageItemKind::Statement) {
+                    let line = item.loc.lines.start;
+                    line_hits
+                        .entry(line)
+                        .and_modify(|h| *h = (*h).max(item.hits))
+                        .or_insert(item.hits);
+                }
+            }
+
             let mut recorded_lines = HashSet::new();
 
             for item in items {
@@ -160,11 +179,18 @@ impl CoverageReporter for LcovReporter {
                         }
                     }
                     CoverageItemKind::Branch { branch_id, path_id, .. } => {
-                        writeln!(
-                            out,
-                            "BRDA:{line},{branch_id},{path_id},{}",
-                            if hits == 0 { "-".to_string() } else { hits.to_string() }
-                        )?;
+                        // Per LCOV spec: "-" means the expression was never evaluated (line not
+                        // executed), "0" means branch exists but was never taken.
+                        // Check if the line containing this branch was hit.
+                        let line_was_hit = line_hits.get(&line).is_some_and(|&h| h > 0);
+                        let hits_str = if hits > 0 {
+                            hits.to_string()
+                        } else if line_was_hit {
+                            "0".to_string()
+                        } else {
+                            "-".to_string()
+                        };
+                        writeln!(out, "BRDA:{line},{branch_id},{path_id},{hits_str}")?;
                     }
                 }
             }
@@ -201,31 +227,28 @@ impl CoverageReporter for DebugReporter {
 
     fn report(&mut self, report: &CoverageReport) -> eyre::Result<()> {
         for (path, items) in report.items_by_file() {
-            sh_println!("Uncovered for {}:", path.display())?;
+            let src = fs::read_to_string(path)?;
+            sh_println!("{}:", path.display())?;
             for item in items {
-                if item.hits == 0 {
-                    sh_println!("- {item}")?;
-                }
+                sh_println!("- {}", item.fmt_with_source(Some(&src)))?;
             }
             sh_println!()?;
         }
 
-        for (contract_id, anchors) in &report.anchors {
+        for (contract_id, (cta, rta)) in &report.anchors {
+            if cta.is_empty() && rta.is_empty() {
+                continue;
+            }
+
             sh_println!("Anchors for {contract_id}:")?;
-            let anchors = anchors
-                .0
+            let anchors = cta
                 .iter()
                 .map(|anchor| (false, anchor))
-                .chain(anchors.1.iter().map(|anchor| (true, anchor)));
-            for (is_deployed, anchor) in anchors {
-                sh_println!("- {anchor}")?;
-                if is_deployed {
-                    sh_println!("- Creation code")?;
-                } else {
-                    sh_println!("- Runtime code")?;
-                }
+                .chain(rta.iter().map(|anchor| (true, anchor)));
+            for (is_runtime, anchor) in anchors {
+                let kind = if is_runtime { " runtime" } else { "creation" };
                 sh_println!(
-                    "  - Refers to item: {}",
+                    "- {kind} {anchor}: {}",
                     report
                         .analyses
                         .get(&contract_id.version)

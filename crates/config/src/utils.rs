@@ -35,7 +35,7 @@ pub fn load_config_with_root(root: Option<&Path>) -> eyre::Result<Config> {
 pub fn find_git_root(relative_to: &Path) -> io::Result<Option<PathBuf>> {
     let root =
         if relative_to.is_absolute() { relative_to } else { &dunce::canonicalize(relative_to)? };
-    Ok(root.ancestors().find(|p| p.join(".git").is_dir()).map(Path::to_path_buf))
+    Ok(root.ancestors().find(|p| p.join(".git").exists()).map(Path::to_path_buf))
 }
 
 /// Returns the root path to set for the project root.
@@ -213,7 +213,7 @@ where
     deserialize_u64_or_max(deserializer)?.try_into().map_err(D::Error::custom)
 }
 
-/// Deserialize into `U256` from either a `u64` or a `U256` hex string.
+/// Deserialize into `U256` from either a `u64`, a `U256` hex string, or a decimal string.
 pub fn deserialize_u64_to_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
 where
     D: Deserializer<'de>,
@@ -223,11 +223,16 @@ where
     enum NumericValue {
         U256(U256),
         U64(u64),
+        String(String),
     }
 
     match NumericValue::deserialize(deserializer)? {
         NumericValue::U64(n) => Ok(U256::from(n)),
         NumericValue::U256(n) => Ok(n),
+        NumericValue::String(s) => {
+            // Handle decimal strings (e.g., "18446744073709551615")
+            U256::from_str(&s).map_err(D::Error::custom)
+        }
     }
 }
 
@@ -283,11 +288,7 @@ impl FromStr for Numeric {
 }
 
 /// Returns the [SpecId] derived from [EvmVersion]
-#[inline]
-pub fn evm_spec_id(evm_version: EvmVersion, odyssey: bool) -> SpecId {
-    if odyssey {
-        return SpecId::OSAKA;
-    }
+pub fn evm_spec_id(evm_version: EvmVersion) -> SpecId {
     match evm_version {
         EvmVersion::Homestead => SpecId::HOMESTEAD,
         EvmVersion::TangerineWhistle => SpecId::TANGERINE,

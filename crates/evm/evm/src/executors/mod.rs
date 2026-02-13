@@ -44,6 +44,10 @@ use revm::{
 };
 use std::{
     borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -56,8 +60,12 @@ pub use fuzz::FuzzedExecutor;
 pub mod invariant;
 pub use invariant::InvariantExecutor;
 
+mod corpus;
 mod trace;
+
 pub use trace::TracingExecutor;
+
+const DURATION_BETWEEN_METRICS_REPORT: Duration = Duration::from_secs(5);
 
 sol! {
     interface ITest {
@@ -83,11 +91,14 @@ sol! {
 #[derive(Clone, Debug)]
 pub struct Executor {
     /// The underlying `revm::Database` that contains the EVM storage.
+    ///
+    /// Wrapped in `Arc` for efficient cloning during parallel fuzzing. Use [`Arc::make_mut`]
+    /// for copy-on-write semantics when mutation is needed.
     // Note: We do not store an EVM here, since we are really
     // only interested in the database. REVM's `EVM` is a thin
     // wrapper around spawning a new EVM on every call anyway,
     // so the performance difference should be negligible.
-    backend: Backend,
+    backend: Arc<Backend>,
     /// The EVM environment.
     env: Env,
     /// The Revm inspector stack.
@@ -127,7 +138,7 @@ impl Executor {
             },
         );
 
-        Self { backend, env, inspector, gas_limit, legacy_assertions }
+        Self { backend: Arc::new(backend), env, inspector, gas_limit, legacy_assertions }
     }
 
     fn clone_with_backend(&self, backend: Backend) -> Self {
@@ -137,7 +148,13 @@ impl Executor {
             self.env.tx.clone(),
             self.spec_id(),
         );
-        Self::new(backend, env, self.inspector().clone(), self.gas_limit, self.legacy_assertions)
+        Self {
+            backend: Arc::new(backend),
+            env,
+            inspector: self.inspector().clone(),
+            gas_limit: self.gas_limit,
+            legacy_assertions: self.legacy_assertions,
+        }
     }
 
     /// Returns a reference to the EVM backend.
@@ -146,8 +163,11 @@ impl Executor {
     }
 
     /// Returns a mutable reference to the EVM backend.
+    ///
+    /// Uses copy-on-write semantics: if other clones of this executor share the backend,
+    /// this will clone the backend first.
     pub fn backend_mut(&mut self) -> &mut Backend {
-        &mut self.backend
+        Arc::make_mut(&mut self.backend)
     }
 
     /// Returns a reference to the EVM environment.
@@ -359,7 +379,7 @@ impl Executor {
         // persistent across fork swaps in forking mode
         self.backend_mut().add_persistent_account(address);
 
-        debug!(%address, "deployed contract");
+        trace!(%address, "deployed contract");
 
         Ok(DeployResult { raw: result, address })
     }
@@ -481,6 +501,22 @@ impl Executor {
         value: U256,
     ) -> eyre::Result<RawCallResult> {
         let env = self.build_test_env(from, TxKind::Call(to), calldata, value);
+        self.transact_with_env(env)
+    }
+
+    /// Performs a raw call to an account on the current state of the VM with an EIP-7702
+    /// authorization last.
+    pub fn transact_raw_with_authorization(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        value: U256,
+        authorization_list: Vec<SignedAuthorization>,
+    ) -> eyre::Result<RawCallResult> {
+        let mut env = self.build_test_env(from, TxKind::Call(to), calldata, value);
+        env.tx.set_signed_authorization(authorization_list);
+        env.tx.tx_type = 4;
         self.transact_with_env(env)
     }
 
@@ -846,7 +882,7 @@ pub struct RawCallResult {
     /// The raw output of the execution
     pub out: Option<Output>,
     /// The chisel state
-    pub chisel_state: Option<(Vec<U256>, Vec<u8>, Option<InstructionResult>)>,
+    pub chisel_state: Option<(Vec<U256>, Vec<u8>)>,
     pub reverter: Option<Address>,
 }
 
@@ -883,14 +919,6 @@ impl RawCallResult {
             Ok(r) => Ok((r, None)),
             Err(EvmError::Execution(e)) => Ok((e.raw, Some(e.reason))),
             Err(e) => Err(e.into()),
-        }
-    }
-
-    /// Unpacks an execution result.
-    pub fn from_execution_result(r: Result<Self, ExecutionErr>) -> (Self, Option<String>) {
-        match r {
-            Ok(r) => (r, None),
-            Err(e) => (e.raw, Some(e.reason)),
         }
     }
 
@@ -1095,8 +1123,46 @@ impl FuzzTestTimer {
         Self { inner: timeout.map(|timeout| (Instant::now(), Duration::from_secs(timeout.into()))) }
     }
 
+    /// Whether the fuzz test timer is enabled.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Whether the current fuzz test timed out and should be stopped.
     pub fn is_timed_out(&self) -> bool {
         self.inner.is_some_and(|(start, duration)| start.elapsed() > duration)
+    }
+}
+
+/// Helper struct to enable early exit behavior: when one test fails or run is interrupted,
+/// all other tests stop early.
+#[derive(Clone, Debug)]
+pub struct EarlyExit {
+    /// Shared atomic flag set to `true` when a failure occurs or ctrl-c received.
+    inner: Arc<AtomicBool>,
+    /// Whether to exit early on test failure (fail-fast mode).
+    fail_fast: bool,
+}
+
+impl EarlyExit {
+    pub fn new(fail_fast: bool) -> Self {
+        Self { inner: Arc::new(AtomicBool::new(false)), fail_fast }
+    }
+
+    /// Records a test failure. Only triggers early exit if fail-fast mode is enabled.
+    pub fn record_failure(&self) {
+        if self.fail_fast {
+            self.inner.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Records a Ctrl-C interrupt. Always triggers early exit.
+    pub fn record_ctrl_c(&self) {
+        self.inner.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether tests should stop and exit early.
+    pub fn should_stop(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
     }
 }

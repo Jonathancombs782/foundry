@@ -6,9 +6,8 @@ use crate::{
     utils::http_provider_with_signer,
 };
 use alloy_consensus::{SignableTransaction, TxEip1559};
-use alloy_hardforks::EthereumHardfork;
 use alloy_network::{EthereumWallet, TransactionBuilder, TxSignerSync};
-use alloy_primitives::{Address, Bytes, TxKind, U256, address, fixed_bytes, utils::Unit};
+use alloy_primitives::{Address, Bytes, TxKind, U256, address, fixed_bytes};
 use alloy_provider::{Provider, ext::TxPoolApi};
 use alloy_rpc_types::{
     BlockId, BlockNumberOrTag, TransactionRequest,
@@ -17,21 +16,13 @@ use alloy_rpc_types::{
     },
 };
 use alloy_serde::WithOtherFields;
-use anvil::{
-    NodeConfig,
-    eth::{
-        api::CLIENT_VERSION,
-        backend::mem::{EXECUTOR, P256_DELEGATION_CONTRACT, P256_DELEGATION_RUNTIME_CODE},
-    },
-    spawn,
-};
+use anvil::{NodeConfig, eth::api::CLIENT_VERSION, spawn};
 use anvil_core::{
-    eth::{
-        EthRequest,
-        wallet::{Capabilities, DelegationCapability, WalletCapabilities},
-    },
+    eth::EthRequest,
     types::{ReorgOptions, TransactionData},
 };
+use foundry_evm::hardfork::EthereumHardfork;
+
 use revm::primitives::hardfork::SpecId;
 use std::{
     str::FromStr,
@@ -449,7 +440,7 @@ async fn can_get_node_info() {
 
     let block_number = provider.get_block_number().await.unwrap();
     let block = provider.get_block(BlockId::from(block_number)).await.unwrap().unwrap();
-    let hard_fork: &str = SpecId::PRAGUE.into();
+    let hard_fork: &str = SpecId::OSAKA.into();
 
     let expected_node_info = NodeInfo {
         current_block_number: 0_u64,
@@ -667,7 +658,7 @@ async fn can_remove_pool_transactions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_reorg() {
+async fn flaky_test_reorg() {
     let (api, handle) = spawn(NodeConfig::test()).await;
     let provider = handle.http_provider();
 
@@ -796,6 +787,112 @@ async fn test_reorg() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_reorg_blockhash_opcode_consistency() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let multicall = Multicall::deploy(&provider).await.unwrap();
+
+    api.evm_mine(Some(MineOptions::Options { timestamp: None, blocks: Some(200) })).await.unwrap();
+
+    let tip_before_reorg = api.block_number().unwrap().to::<u64>();
+
+    let mut cached_hashes: Vec<(u64, alloy_primitives::B256, alloy_primitives::B256)> = Vec::new();
+    for i in 1..=10 {
+        let block_num = tip_before_reorg - i;
+        let rpc_hash =
+            provider.get_block_by_number(block_num.into()).await.unwrap().unwrap().header.hash;
+        let opcode_hash = multicall.getBlockHash(U256::from(block_num)).call().await.unwrap();
+        assert_eq!(rpc_hash, opcode_hash, "RPC and BLOCKHASH opcode should match before reorg");
+        cached_hashes.push((block_num, rpc_hash, opcode_hash));
+    }
+
+    let tx = TransactionRequest::default();
+    api.anvil_reorg(ReorgOptions {
+        depth: 5,
+        tx_block_pairs: vec![(TransactionData::JSON(tx), 0)],
+    })
+    .await
+    .unwrap();
+
+    api.mine_one().await;
+
+    for (block_num, _rpc_before, _opcode_before) in &cached_hashes {
+        let rpc_after =
+            provider.get_block_by_number((*block_num).into()).await.unwrap().unwrap().header.hash;
+        let opcode_after = multicall.getBlockHash(U256::from(*block_num)).call().await.unwrap();
+        assert_eq!(
+            rpc_after, opcode_after,
+            "Block {block_num}: RPC ({rpc_after}) and BLOCKHASH opcode ({opcode_after}) should match after reorg"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_reorg_deep_blockhash_consistency() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = handle.http_provider();
+
+    let multicall = Multicall::deploy(&provider).await.unwrap();
+
+    // Mine 300 blocks (more than BLOCKHASH limit of 256)
+    api.evm_mine(Some(MineOptions::Options { timestamp: None, blocks: Some(300) })).await.unwrap();
+
+    let tip_before_reorg = api.block_number().unwrap().to::<u64>();
+    assert!(tip_before_reorg > 256, "Need more than 256 blocks for this test");
+
+    // Check blocks within the 256 window before reorg
+    let mut cached_hashes: Vec<(u64, alloy_primitives::B256)> = Vec::new();
+    for i in [1, 10, 100, 200, 255] {
+        let block_num = tip_before_reorg - i;
+        let rpc_hash =
+            provider.get_block_by_number(block_num.into()).await.unwrap().unwrap().header.hash;
+        let opcode_hash = multicall.getBlockHash(U256::from(block_num)).call().await.unwrap();
+        assert_eq!(rpc_hash, opcode_hash, "RPC and BLOCKHASH opcode should match before reorg");
+        cached_hashes.push((block_num, rpc_hash));
+    }
+
+    // Perform a deep reorg (50 blocks)
+    let tx = TransactionRequest::default();
+    api.anvil_reorg(ReorgOptions {
+        depth: 50,
+        tx_block_pairs: vec![(TransactionData::JSON(tx), 0)],
+    })
+    .await
+    .unwrap();
+
+    api.mine_one().await;
+
+    let tip_after_reorg = api.block_number().unwrap().to::<u64>();
+
+    // Verify blocks still in the 256 window have consistent hashes
+    for (block_num, _rpc_before) in &cached_hashes {
+        // Skip blocks that were reorged
+        if *block_num > tip_after_reorg - 50 {
+            continue;
+        }
+        let rpc_after =
+            provider.get_block_by_number((*block_num).into()).await.unwrap().unwrap().header.hash;
+        let opcode_after = multicall.getBlockHash(U256::from(*block_num)).call().await.unwrap();
+        assert_eq!(
+            rpc_after, opcode_after,
+            "Block {block_num}: RPC and BLOCKHASH should match after deep reorg"
+        );
+    }
+
+    // Verify BLOCKHASH returns 0 for blocks outside the 256 window
+    let old_block = tip_after_reorg.saturating_sub(257);
+    if old_block > 0 {
+        let opcode_hash = multicall.getBlockHash(U256::from(old_block)).call().await.unwrap();
+        assert_eq!(
+            opcode_hash,
+            alloy_primitives::B256::ZERO,
+            "BLOCKHASH should return 0 for blocks outside 256 window"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_rollback() {
     let (api, handle) = spawn(NodeConfig::test()).await;
     let provider = handle.http_provider();
@@ -825,75 +922,6 @@ async fn test_rollback() {
     // Assert we're at block 1 and the block contents are kept the same
     let head = provider.get_block(BlockId::latest()).await.unwrap().unwrap();
     assert_eq!(head, block1);
-}
-
-// === wallet endpoints === //
-#[tokio::test(flavor = "multi_thread")]
-async fn can_get_wallet_capabilities() {
-    let (api, handle) = spawn(NodeConfig::test().with_odyssey(true)).await;
-
-    let provider = handle.http_provider();
-
-    let init_sponsor_bal = provider.get_balance(EXECUTOR).await.unwrap();
-
-    let expected_bal = Unit::ETHER.wei().saturating_mul(U256::from(10_000));
-    assert_eq!(init_sponsor_bal, expected_bal);
-
-    let p256_code = provider.get_code_at(P256_DELEGATION_CONTRACT).await.unwrap();
-
-    assert_eq!(p256_code, Bytes::from_static(P256_DELEGATION_RUNTIME_CODE));
-
-    let capabilities = api.get_capabilities().unwrap();
-
-    let mut expect_caps = WalletCapabilities::default();
-    let cap: Capabilities = Capabilities {
-        delegation: DelegationCapability { addresses: vec![P256_DELEGATION_CONTRACT] },
-    };
-    expect_caps.insert(api.chain_id(), cap);
-
-    assert_eq!(capabilities, expect_caps);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn can_add_capability() {
-    let (api, _handle) = spawn(NodeConfig::test().with_odyssey(true)).await;
-
-    let init_capabilities = api.get_capabilities().unwrap();
-
-    let mut expect_caps = WalletCapabilities::default();
-    let cap: Capabilities = Capabilities {
-        delegation: DelegationCapability { addresses: vec![P256_DELEGATION_CONTRACT] },
-    };
-    expect_caps.insert(api.chain_id(), cap);
-
-    assert_eq!(init_capabilities, expect_caps);
-
-    let new_cap_addr = Address::with_last_byte(1);
-
-    api.anvil_add_capability(new_cap_addr).unwrap();
-
-    let capabilities = api.get_capabilities().unwrap();
-
-    let cap: Capabilities = Capabilities {
-        delegation: DelegationCapability {
-            addresses: vec![P256_DELEGATION_CONTRACT, new_cap_addr],
-        },
-    };
-    expect_caps.insert(api.chain_id(), cap);
-
-    assert_eq!(capabilities, expect_caps);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn can_set_executor() {
-    let (api, _handle) = spawn(NodeConfig::test().with_odyssey(true)).await;
-
-    let expected_addr = address!("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-    let pk = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string();
-
-    let executor = api.anvil_set_executor(pk).unwrap();
-
-    assert_eq!(executor, expected_addr);
 }
 
 #[tokio::test(flavor = "multi_thread")]

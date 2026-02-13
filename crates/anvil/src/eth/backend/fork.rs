@@ -1,12 +1,12 @@
 //! Support for forking off another client
 
 use crate::eth::{backend::db::Db, error::BlockchainError, pool::transactions::PoolTransaction};
-use alloy_consensus::Account;
+use alloy_consensus::TrieAccount;
 use alloy_eips::eip2930::AccessListResult;
 use alloy_network::{AnyRpcBlock, AnyRpcTransaction, BlockResponse, TransactionResponse};
 use alloy_primitives::{
     Address, B256, Bytes, StorageValue, U256,
-    map::{FbHashMap, HashMap},
+    map::{FbHashMap, HashMap, HashSet},
 };
 use alloy_provider::{
     Provider,
@@ -19,13 +19,13 @@ use alloy_rpc_types::{
     simulate::{SimulatePayload, SimulatedBlock},
     trace::{
         geth::{GethDebugTracingOptions, GethTrace},
-        parity::LocalizedTransactionTrace as Trace,
+        parity::{LocalizedTransactionTrace as Trace, TraceResultsWithTransactionHash, TraceType},
     },
 };
 use alloy_serde::WithOtherFields;
 use alloy_transport::TransportError;
-use anvil_core::eth::transaction::{ReceiptResponse, convert_to_anvil_receipt};
 use foundry_common::provider::{ProviderBuilder, RetryProvider};
+use foundry_primitives::FoundryTxReceipt;
 use parking_lot::{
     RawRwLock, RwLock,
     lock_api::{RwLockReadGuard, RwLockWriteGuard},
@@ -274,7 +274,7 @@ impl ClientFork {
         let code = self.provider().get_code_at(address).block_id(block_id).await?;
 
         let mut storage = self.storage_write();
-        storage.code_at.insert((address, blocknumber), code.clone().0.into());
+        storage.code_at.insert((address, blocknumber), code.clone());
 
         Ok(code)
     }
@@ -297,7 +297,7 @@ impl ClientFork {
         &self,
         address: Address,
         blocknumber: u64,
-    ) -> Result<Account, TransportError> {
+    ) -> Result<TrieAccount, TransportError> {
         trace!(target: "backend::fork", "get_account={:?}", address);
         self.provider().get_account(address).block_id(blocknumber.into()).await
     }
@@ -419,17 +419,27 @@ impl ClientFork {
         Ok(traces)
     }
 
+    pub async fn trace_replay_block_transactions(
+        &self,
+        number: u64,
+        trace_types: HashSet<TraceType>,
+    ) -> Result<Vec<TraceResultsWithTransactionHash>, TransportError> {
+        // Forward to upstream provider for historical blocks
+        let params = (number, trace_types.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>());
+        self.provider().raw_request("trace_replayBlockTransactions".into(), params).await
+    }
+
     pub async fn transaction_receipt(
         &self,
         hash: B256,
-    ) -> Result<Option<ReceiptResponse>, BlockchainError> {
+    ) -> Result<Option<FoundryTxReceipt>, BlockchainError> {
         if let Some(receipt) = self.storage_read().transaction_receipts.get(&hash).cloned() {
             return Ok(Some(receipt));
         }
 
         if let Some(receipt) = self.provider().get_transaction_receipt(hash).await? {
-            let receipt =
-                convert_to_anvil_receipt(receipt).ok_or(BlockchainError::FailedToDecodeReceipt)?;
+            let receipt = FoundryTxReceipt::try_from(receipt)
+                .map_err(|_| BlockchainError::FailedToDecodeReceipt)?;
             let mut storage = self.storage_write();
             storage.transaction_receipts.insert(hash, receipt.clone());
             return Ok(Some(receipt));
@@ -441,7 +451,7 @@ impl ClientFork {
     pub async fn block_receipts(
         &self,
         number: u64,
-    ) -> Result<Option<Vec<ReceiptResponse>>, BlockchainError> {
+    ) -> Result<Option<Vec<FoundryTxReceipt>>, BlockchainError> {
         if let receipts @ Some(_) = self.storage_read().block_receipts.get(&number).cloned() {
             return Ok(receipts);
         }
@@ -455,8 +465,8 @@ impl ClientFork {
                 .map(|r| {
                     r.into_iter()
                         .map(|r| {
-                            convert_to_anvil_receipt(r)
-                                .ok_or(BlockchainError::FailedToDecodeReceipt)
+                            FoundryTxReceipt::try_from(r)
+                                .map_err(|_| BlockchainError::FailedToDecodeReceipt)
                         })
                         .collect::<Result<Vec<_>, _>>()
                 })
@@ -708,12 +718,12 @@ pub struct ForkedStorage {
     pub blocks: FbHashMap<32, AnyRpcBlock>,
     pub hashes: HashMap<u64, B256>,
     pub transactions: FbHashMap<32, AnyRpcTransaction>,
-    pub transaction_receipts: FbHashMap<32, ReceiptResponse>,
+    pub transaction_receipts: FbHashMap<32, FoundryTxReceipt>,
     pub transaction_traces: FbHashMap<32, Vec<Trace>>,
     pub logs: HashMap<Filter, Vec<Log>>,
     pub geth_transaction_traces: FbHashMap<32, GethTrace>,
     pub block_traces: HashMap<u64, Vec<Trace>>,
-    pub block_receipts: HashMap<u64, Vec<ReceiptResponse>>,
+    pub block_receipts: HashMap<u64, Vec<FoundryTxReceipt>>,
     pub code_at: HashMap<(Address, u64), Bytes>,
 }
 

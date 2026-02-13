@@ -8,13 +8,37 @@ use std::{fmt, path::Path};
 /// Test filter.
 pub trait TestFilter: Send + Sync {
     /// Returns whether the test should be included.
-    fn matches_test(&self, test_name: &str) -> bool;
+    fn matches_test(&self, test_signature: &str) -> bool;
 
     /// Returns whether the contract should be included.
     fn matches_contract(&self, contract_name: &str) -> bool;
 
     /// Returns a contract with the given path should be included.
     fn matches_path(&self, path: &Path) -> bool;
+}
+
+impl<'a> dyn TestFilter + 'a {
+    /// Returns `true` if the function is a test function that matches the given filter.
+    pub fn matches_test_function(&self, func: &Function) -> bool {
+        func.is_any_test() && self.matches_test(&func.signature())
+    }
+}
+
+/// A test filter that filters out nothing.
+#[derive(Clone, Debug, Default)]
+pub struct EmptyTestFilter(());
+impl TestFilter for EmptyTestFilter {
+    fn matches_test(&self, _test_signature: &str) -> bool {
+        true
+    }
+
+    fn matches_contract(&self, _contract_name: &str) -> bool {
+        true
+    }
+
+    fn matches_path(&self, _path: &Path) -> bool {
+        true
+    }
 }
 
 /// Extension trait for `Function`.
@@ -137,7 +161,6 @@ pub enum TestFunctionKind {
 
 impl TestFunctionKind {
     /// Classify a function.
-    #[inline]
     pub fn classify(name: &str, has_inputs: bool) -> Self {
         match () {
             _ if name.starts_with("test") => {
@@ -152,7 +175,7 @@ impl TestFunctionKind {
                 Self::InvariantTest
             }
             _ if name.starts_with("table") => Self::TableTest,
-            _ if name.eq_ignore_ascii_case("setup") => Self::Setup,
+            _ if name.eq_ignore_ascii_case("setup") && !has_inputs => Self::Setup,
             _ if name.eq_ignore_ascii_case("afterinvariant") => Self::AfterInvariant,
             _ if name.starts_with("fixture") => Self::Fixture,
             _ => Self::Unknown,
@@ -260,5 +283,20 @@ pub trait ErrorExt: std::error::Error {
 impl<T: std::error::Error> ErrorExt for T {
     fn abi_encode_revert(&self) -> Bytes {
         alloy_sol_types::Revert::from(self.to_string()).abi_encode().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_setup_classification() {
+        // setUp() with no params should be classified as Setup
+        assert_eq!(TestFunctionKind::classify("setUp", false), TestFunctionKind::Setup);
+
+        // setUp(bytes memory) with params should NOT be classified as Setup
+        // This is common in Gnosis Safe/Zodiac modules
+        assert_eq!(TestFunctionKind::classify("setUp", true), TestFunctionKind::Unknown);
     }
 }

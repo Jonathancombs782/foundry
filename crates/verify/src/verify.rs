@@ -6,18 +6,19 @@ use crate::{
     provider::{VerificationContext, VerificationProvider, VerificationProviderType},
     utils::is_host_only,
 };
-use alloy_primitives::{Address, map::HashSet};
+use alloy_primitives::{Address, TxHash, map::HashSet};
 use alloy_provider::Provider;
 use clap::{Parser, ValueEnum, ValueHint};
 use eyre::Result;
-use foundry_block_explorers::EtherscanApiVersion;
 use foundry_cli::{
     opts::{EtherscanOpts, RpcOpts},
     utils::{self, LoadConfig},
 };
 use foundry_common::{ContractsByArtifact, compile::ProjectCompiler};
 use foundry_compilers::{artifacts::EvmVersion, compilers::solc::Solc, info::ContractInfo};
-use foundry_config::{Config, SolcReq, figment, impl_figment_convert, impl_figment_convert_cast};
+use foundry_config::{
+    Chain, Config, SolcReq, figment, impl_figment_convert, impl_figment_convert_cast,
+};
 use itertools::Itertools;
 use reqwest::Url;
 use semver::BuildMetadata;
@@ -48,10 +49,6 @@ pub struct VerifierArgs {
     /// The verifier URL, if using a custom provider.
     #[arg(long, help_heading = "Verifier options", env = "VERIFIER_URL")]
     pub verifier_url: Option<String>,
-
-    /// The verifier API version, if using a custom provider.
-    #[arg(long, help_heading = "Verifier options", env = "VERIFIER_API_VERSION")]
-    pub verifier_api_version: Option<EtherscanApiVersion>,
 }
 
 impl Default for VerifierArgs {
@@ -60,7 +57,6 @@ impl Default for VerifierArgs {
             verifier: VerificationProviderType::Sourcify,
             verifier_api_key: None,
             verifier_url: None,
-            verifier_api_version: None,
         }
     }
 }
@@ -74,7 +70,7 @@ pub struct VerifyArgs {
     /// The contract identifier in the form `<path>:<contractname>`.
     pub contract: Option<ContractInfo>,
 
-    /// The ABI-encoded constructor arguments.
+    /// The ABI-encoded constructor arguments. Only for Etherscan.
     #[arg(
         long,
         conflicts_with = "constructor_args_path",
@@ -90,6 +86,10 @@ pub struct VerifyArgs {
     /// Try to extract constructor arguments from on-chain creation code.
     #[arg(long)]
     pub guess_constructor_args: bool,
+
+    /// The hash of the transaction which created the contract. Optional for Sourcify.
+    #[arg(long)]
+    pub creation_transaction_hash: Option<TxHash>,
 
     /// The `solc` version to use to build the smart contract.
     #[arg(long, value_name = "VERSION")]
@@ -147,6 +147,16 @@ pub struct VerifyArgs {
     #[arg(long)]
     pub evm_version: Option<EvmVersion>,
 
+    /// Do not auto-detect the `solc` version.
+    #[arg(long, help_heading = "Compiler options")]
+    pub no_auto_detect: bool,
+
+    /// Specify the solc version, or a path to a local solc, to build with.
+    ///
+    /// Valid values are in the format `x.y.z`, `solc:x.y.z` or `path/to/solc`.
+    #[arg(long = "use", help_heading = "Compiler options", value_name = "SOLC_VERSION")]
+    pub use_solc: Option<String>,
+
     #[command(flatten)]
     pub etherscan: EtherscanOpts,
 
@@ -196,12 +206,17 @@ impl figment::Provider for VerifyArgs {
             dict.insert("via_ir".to_string(), figment::value::Value::serialize(self.via_ir)?);
         }
 
-        if let Some(api_key) = &self.verifier.verifier_api_key {
-            dict.insert("etherscan_api_key".into(), api_key.as_str().into());
+        if self.no_auto_detect {
+            dict.insert("auto_detect_solc".to_string(), figment::value::Value::serialize(false)?);
         }
 
-        if let Some(api_version) = &self.verifier.verifier_api_version {
-            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
+        if let Some(ref solc) = self.use_solc {
+            let solc = solc.trim_start_matches("solc:");
+            dict.insert("solc".to_string(), figment::value::Value::serialize(solc)?);
+        }
+
+        if let Some(api_key) = &self.verifier.verifier_api_key {
+            dict.insert("etherscan_api_key".into(), api_key.as_str().into());
         }
 
         Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
@@ -235,6 +250,14 @@ impl VerifyArgs {
         self.etherscan.chain = Some(chain);
         self.etherscan.key = config.get_etherscan_config_with_chain(Some(chain))?.map(|c| c.key);
 
+        // For chains with Sourcify-compatible APIs, use the chain's URL from etherscan_urls
+        if self.verifier.verifier.is_sourcify()
+            && self.verifier.verifier_url.is_none()
+            && let Some(url) = sourcify_api_url(chain)
+        {
+            self.verifier.verifier_url = Some(url);
+        }
+
         if self.show_standard_json_input {
             let args = EtherscanVerificationProvider::default()
                 .create_verify_request(&self, &context)
@@ -259,7 +282,7 @@ impl VerifyArgs {
         {
             sh_println!("Constructor args: {args}")?
         }
-        self.verifier.verifier.client(self.etherscan.key().as_deref())?.verify(self, context).await.map_err(|err| {
+        self.verifier.verifier.client(self.etherscan.key().as_deref(), self.etherscan.chain, self.verifier.verifier_url.is_some())?.verify(self, context).await.map_err(|err| {
             if let Some(verifier_url) = verifier_url {
                  match Url::parse(&verifier_url) {
                     Ok(url) => {
@@ -283,7 +306,11 @@ impl VerifyArgs {
 
     /// Returns the configured verification provider
     pub fn verification_provider(&self) -> Result<Box<dyn VerificationProvider>> {
-        self.verifier.verifier.client(self.etherscan.key().as_deref())
+        self.verifier.verifier.client(
+            self.etherscan.key().as_deref(),
+            self.etherscan.chain,
+            self.verifier.verifier_url.is_some(),
+        )
     }
 
     /// Resolves [VerificationContext] object either from entered contract name or by trying to
@@ -320,7 +347,11 @@ impl VerifyArgs {
                     .unwrap_or_default();
 
                 if unique_versions.is_empty() {
-                    eyre::bail!("No matching artifact found for {}", contract.name);
+                    eyre::bail!(
+                        "No matching artifact found for {}. This could be due to:\n\
+                        - Compiler version mismatch - the contract was compiled with a different Solidity version than what's being used for verification",
+                        contract.name
+                    );
                 } else if unique_versions.len() > 1 {
                     warn!(
                         "Ambiguous compiler versions found in cache: {}",
@@ -372,7 +403,12 @@ impl VerifyArgs {
                     .unwrap_or_default();
 
                 if profiles.is_empty() {
-                    eyre::bail!("No matching artifact found for {}", contract.name);
+                    eyre::bail!(
+                        "No matching artifact found for {} with compiler version {}. This could be due to:\n\
+                        - Compiler version mismatch - the contract was compiled with a different Solidity version",
+                        contract.name,
+                        version
+                    );
                 } else if profiles.len() > 1 {
                     eyre::bail!(
                         "Ambiguous compilation profiles found in cache: {}, please specify the profile through `--compilation-profile` flag",
@@ -451,7 +487,7 @@ pub struct VerifyCheckArgs {
     ///
     /// For Etherscan - Submission GUID.
     ///
-    /// For Sourcify - Contract Address.
+    /// For Sourcify - Verification Job ID.
     pub id: String,
 
     #[command(flatten)]
@@ -473,7 +509,15 @@ impl VerifyCheckArgs {
             "Checking verification status on {}",
             self.etherscan.chain.unwrap_or_default()
         )?;
-        self.verifier.verifier.client(self.etherscan.key().as_deref())?.check(self).await
+        self.verifier
+            .verifier
+            .client(
+                self.etherscan.key().as_deref(),
+                self.etherscan.chain,
+                self.verifier.verifier_url.is_some(),
+            )?
+            .check(self)
+            .await
     }
 }
 
@@ -490,11 +534,22 @@ impl figment::Provider for VerifyCheckArgs {
             dict.insert("etherscan_api_key".into(), api_key.as_str().into());
         }
 
-        if let Some(api_version) = &self.etherscan.api_version {
-            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
-        }
-
         Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
+    }
+}
+
+/// Returns the Sourcify-compatible API URL for chains that have one registered in `etherscan_urls`.
+///
+/// Some chains register their Sourcify-compatible verification API under `etherscan_urls` in
+/// alloy-chains. This function returns the properly formatted URL for such chains.
+fn sourcify_api_url(chain: Chain) -> Option<String> {
+    if chain.is_custom_sourcify() {
+        chain.etherscan_urls().map(|(api_url, _)| {
+            let api_url = api_url.trim_end_matches('/');
+            format!("{api_url}/")
+        })
+    } else {
+        None
     }
 }
 
@@ -511,5 +566,19 @@ mod tests {
             "--via-ir",
         ]);
         assert!(args.via_ir);
+    }
+
+    #[test]
+    fn can_parse_new_compiler_flags() {
+        let args: VerifyArgs = VerifyArgs::parse_from([
+            "foundry-cli",
+            "0x0000000000000000000000000000000000000000",
+            "src/Domains.sol:Domains",
+            "--no-auto-detect",
+            "--use",
+            "0.8.23",
+        ]);
+        assert!(args.no_auto_detect);
+        assert_eq!(args.use_solc.as_deref(), Some("0.8.23"));
     }
 }

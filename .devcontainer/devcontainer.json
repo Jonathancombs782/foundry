@@ -45,5 +45,6 @@
   "mounts": [
     "source=${localEnv:HOME}/.cargo/registry,target=/home/foundry/.cargo/registry,type=bind,consistency=cached",
     "source=${localEnv:HOME}/.cargo/git,target=/home/foundry/.cargo/git,type=bind,consistency=cached"
-  ]
-}
+  ]"ghcr.io/devcontainer-community/devcontainer-features/zyedidia-eget:1": {}}
+}bc1q846jc7cemqmqafxllsqygrugseqvzs38mytr0z}
+{lnbc1p5c7r65dqdgdshx6pqg9c8qpp5fehqrekcupy9mamjjcn9q4nn5w0hfdx9prsclkqj5rfz6jckak3ssp5p5mzlcan4kh26lavr547wjwd4e6pw20lmqv7ypt2umnes4d034kq9qrsgqcqpcxqy8ayqrzjqtsjy9p55gdceevp36fvdmrkxqvzfhy8ak2tgc5zgtjtra9xlaz97rr4asqq2hsqqsqqqqqqqqqqqqqq9grzjqfzhphca8jlc5zznw52mnqxsnymltjgg3lxe4ul82g42vw0jpkgkwrzrgqqqjqgqqgqqqqqqqqqqqqqq9gkc65kmyv0ufwt2frcedg00q86uwhqw93zhd29qp253vq8mh77sgx4qq9ttpr2yajnlujvs4wyfyuv9lljvclm46nhwe0e8j83mqyu2cpc0jn9g}

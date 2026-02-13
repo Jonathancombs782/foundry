@@ -45,5 +45,5 @@
   "mounts": [
     "source=${localEnv:HOME}/.cargo/registry,target=/home/foundry/.cargo/registry,type=bind,consistency=cached",
     "source=${localEnv:HOME}/.cargo/git,target=/home/foundry/.cargo/git,type=bind,consistency=cached"
-  ]
+  ]"ghcr.io/devcontainer-community/devcontainer-features/zyedidia-eget:1": {}}
 }
